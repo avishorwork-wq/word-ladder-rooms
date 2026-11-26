@@ -111,6 +111,7 @@ class Room {
       }
     } else player.name = name;
     this.touch();
+    this.pushAsync();
     return { state: this.asyncState(pid) };
   }
   asyncMove(pid, wordIn) {
@@ -135,6 +136,7 @@ class Room {
     if (w === end) { this.gameState = 'done'; this.winner = 'both'; }
     else { const other = this.players.find(p => p.id !== pid); this.turnPid = other ? other.id : pid; }
     this.touch();
+    this.pushAsync();
     return { state: this.asyncState(pid) };
   }
   asyncState(pid) {
@@ -145,6 +147,12 @@ class Room {
       winner: this.winner, moves: this.path.length - 1, lastActivity: this.lastActivity,
       nextRoom: this.nextRoom || null, settings: this.settings,
     };
+  }
+  pushAsync() {
+    if (this.mode !== 'async') return;
+    for (const p of this.players) if (p.ws && p.ws.readyState === 1) {
+      try { p.ws.send(JSON.stringify(this.asyncState(p.id))); } catch (e) {}
+    }
   }
   sendTo(player, msg) { if (player.ws && player.ws.readyState === 1) { try { player.ws.send(JSON.stringify(msg)); } catch (e) {} } }
   broadcast(msg, exceptId) {
@@ -166,8 +174,24 @@ class Room {
   joinWS(ws, pid, name) {
     const isOpen = p => p.ws && p.ws.readyState === 1;
     if (this.mode === 'async') {
-      ws.send(JSON.stringify({ t: 'error', msg: 'That code is a Take Turns game - open it from the list on the home screen.', fatal: true }));
-      ws.close();
+      const ap = this.players.find(p => p.id === pid);
+      if (!ap) {
+        ws.send(JSON.stringify({ t: 'error', msg: 'Join the game first, then updates arrive instantly.', fatal: true }));
+        ws.close();
+        return;
+      }
+      if (ap.ws && ap.ws !== ws) { try { ap.ws.close(); } catch (e) {} }
+      ap.ws = ws; ap.name = name; ap.lastMsg = Date.now();
+      ws.on('message', data => {
+        ap.lastMsg = Date.now();
+        let m; try { m = JSON.parse(data); } catch (e) { return; }
+        if (m && m.t === 'ping') { try { ws.send(JSON.stringify({ t: 'pong', echo: m.ts })); } catch (e) {} }
+      });
+      const adrop = () => { if (ap.ws === ws) ap.ws = null; this.touch(); };
+      ws.on('close', adrop);
+      ws.on('error', adrop);
+      try { ws.send(JSON.stringify(this.asyncState(pid))); } catch (e) {}
+      this.touch();
       return;
     }
     let player = this.players.find(p => p.id === pid);
@@ -418,6 +442,7 @@ const server = http.createServer(async (req, res) => {
     nr.asyncInitPair(r.players, puzzle, r.settings);
     r.nextRoom = ncode;
     r.touch();
+    r.pushAsync();
     return json(200, { code: ncode });
   }
   if (url.pathname === '/api/async/state' && req.method === 'GET') {
