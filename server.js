@@ -140,7 +140,7 @@ class Room {
   wire(ws, player) {
     ws.on('message', data => {
       let m; try { m = JSON.parse(data); } catch (e) { return; }
-      this.onMessage(player, m);
+      try { this.onMessage(player, m); } catch (e) { /* one bad message must never take the server down */ }
     });
     const drop = () => {
       if (player.ws === ws) player.ws = null;
@@ -262,9 +262,12 @@ function cors(req, res) {
 }
 function readBody(req) {
   return new Promise(resolve => {
-    let d = '';
+    let d = '', done = false;
+    const finish = () => { if (done) return; done = true; try { resolve(JSON.parse(d || '{}')); } catch (e) { resolve({}); } };
     req.on('data', c => { d += c; if (d.length > 1e5) req.destroy(); });
-    req.on('end', () => { try { resolve(JSON.parse(d || '{}')); } catch (e) { resolve({}); } });
+    req.on('end', finish);
+    req.on('close', finish);
+    req.on('error', finish);
   });
 }
 const server = http.createServer(async (req, res) => {
@@ -273,11 +276,12 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
 
-  if (url.pathname === '/health') return json(200, { ok: true, rooms: rooms.size, uptime: process.uptime() | 0 });
+  if (url.pathname === '/health') { global.__healthHits = (global.__healthHits || 0) + 1; return json(200, { ok: true, rooms: rooms.size, uptime: process.uptime() | 0, hits: global.__healthHits }); }
 
   if (url.pathname === '/api/room' && req.method === 'POST') {
     const b = await readBody(req);
-    const code = makeCode(6);
+    let code = makeCode(6);
+    for (let tries = 0; tries < 8 && rooms.has(code) && !rooms.get(code).expired(); tries++) code = makeCode(6);
     const r = getRoom(code, true);
     r.initialized = true;
     r.creatorPid = String(b.pid || '').slice(0, 40);
@@ -289,7 +293,8 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/async/create' && req.method === 'POST') {
     const b = await readBody(req);
     if (!b.puzzle || typeof b.puzzle.s !== 'string' || typeof b.puzzle.e !== 'string') return json(400, { error: 'bad puzzle' });
-    const code = makeCode(6);
+    let code = makeCode(6);
+    for (let tries = 0; tries < 8 && rooms.has(code) && !rooms.get(code).expired(); tries++) code = makeCode(6);
     const r = getRoom(code, true);
     r.asyncInit(String(b.pid || '').slice(0, 40), String(b.name || 'Player').slice(0, 14), b.puzzle);
     return json(200, { code });
