@@ -16,6 +16,31 @@ const ALLOWED_ORIGINS = new Set([
   'https://word-ladder.avishorwork.workers.dev',
 ]);
 
+// ---- Server-side puzzle source: room games always use puzzles the server picks ----
+const PUZZLES = {};
+function loadPuzzles() {
+  const langs = ['en', 'es', 'fr', 'de', 'he'];
+  return Promise.all(langs.map(l =>
+    fetch('https://word-ladder-v2.avishorwork.workers.dev/data-' + l + '.js')
+      .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.text(); })
+      .then(t => { globalThis.window = globalThis; (0, eval)(t); const d = globalThis.WORDLADDER_DATA && globalThis.WORDLADDER_DATA[l]; if (d && d.pairs) PUZZLES[l] = d.pairs; })
+      .catch(e => console.log('puzzle load failed for ' + l + ': ' + e.message))
+  )).then(() => console.log('puzzle tables loaded for: ' + Object.keys(PUZZLES).join(',')));
+}
+loadPuzzles();
+function pickPuzzle(settings, avoid) {
+  const s = settings || { len: 4, diff: 'easy', lang: 'en' };
+  const byLen = PUZZLES[s.lang] && PUZZLES[s.lang][s.len];
+  const table = byLen && byLen[s.diff];
+  if (!table || !table.length) return null;
+  for (let i = 0; i < 12; i++) {
+    const p = table[Math.floor(Math.random() * table.length)];
+    if (!avoid || p.s !== avoid.s || p.e !== avoid.e) return { s: p.s, e: p.e, o: p.o };
+  }
+  const p = table[0];
+  return { s: p.s, e: p.e, o: p.o };
+}
+
 function makeCode(n) {
   const bytes = crypto.randomBytes(n);
   let s = '';
@@ -48,9 +73,10 @@ class Room {
   }
   touch() { this.lastActivity = Date.now(); }
   expired() { return Date.now() - this.lastActivity > (this.mode === 'async' ? ASYNC_TTL_MS : ROOM_TTL_MS); }
-  asyncInit(pid, name, puzzle) {
+  asyncInit(pid, name, puzzle, settings) {
     this.initialized = true;
     this.mode = 'async';
+    if (settings) this.settings = { len: (settings.len | 0) || 4, diff: String(settings.diff || 'easy'), lang: String(settings.lang || 'en').slice(0, 4) };
     this.creatorPid = pid;
     this.players = [{ id: pid, name, seq: 1, host: true, ws: null, word: '', moves: 0, path: null }];
     this.nextSeq = 1;
@@ -58,6 +84,19 @@ class Room {
     this.path = [this.puzzle.s];
     this.turnPid = pid;
     this.gameState = 'waiting';
+    this.touch();
+  }
+  asyncInitPair(players, puzzle, settings) {
+    this.initialized = true;
+    this.mode = 'async';
+    if (settings) this.settings = { len: (settings.len | 0) || 4, diff: String(settings.diff || 'easy'), lang: String(settings.lang || 'en').slice(0, 4) };
+    this.creatorPid = players[0].id;
+    this.players = players.slice(0, 2).map((p, i) => ({ id: p.id, name: p.name, seq: i + 1, host: i === 0, ws: null, word: '', moves: 0, path: null }));
+    this.nextSeq = this.players.length;
+    this.puzzle = { s: String(puzzle.s).toLowerCase(), e: String(puzzle.e).toLowerCase(), o: puzzle.o | 0 };
+    this.path = [this.puzzle.s];
+    this.gameState = 'playing';
+    this.turnPid = this.players[Math.floor(Math.random() * this.players.length)].id;
     this.touch();
   }
   asyncJoin(pid, name) {
@@ -104,6 +143,7 @@ class Room {
       turn: this.turnPid, players: this.players.map(p => ({ id: p.id, name: p.name })),
       yourTurn: this.turnPid === pid, inRoom: this.players.some(p => p.id === pid),
       winner: this.winner, moves: this.path.length - 1, lastActivity: this.lastActivity,
+      nextRoom: this.nextRoom || null, settings: this.settings,
     };
   }
   sendTo(player, msg) { if (player.ws && player.ws.readyState === 1) { try { player.ws.send(JSON.stringify(msg)); } catch (e) {} } }
@@ -171,7 +211,7 @@ class Room {
     switch (m.t) {
       case 'ping': this.sendTo(player, { t: 'pong', echo: m.ts }); return;
       case 'settings': {
-        if (!player.host || this.gameState !== 'lobby') return;
+        if (!player.host || (this.gameState !== 'lobby' && this.gameState !== 'done')) return;
         const s = m.settings || {};
         this.settings = { len: (s.len | 0) || 4, diff: String(s.diff || 'easy'), lang: String(s.lang || 'en').slice(0, 4) };
         this.broadcast({ t: 'settings', settings: this.settings }, player.id);
@@ -180,8 +220,10 @@ class Room {
       }
       case 'start': {
         if (!player.host || this.players.length < 2) return;
-        if (!m.puzzle || typeof m.puzzle.s !== 'string' || typeof m.puzzle.e !== 'string') return;
-        this.puzzle = { s: m.puzzle.s.toLowerCase(), e: m.puzzle.e.toLowerCase(), o: m.puzzle.o | 0 };
+        const sp = pickPuzzle(this.settings, null);
+        if (sp) this.puzzle = sp;
+        else if (m.puzzle && typeof m.puzzle.s === 'string' && typeof m.puzzle.e === 'string') this.puzzle = { s: m.puzzle.s.toLowerCase(), e: m.puzzle.e.toLowerCase(), o: m.puzzle.o | 0 };
+        else return;
         this.gameState = 'racing'; this.winner = null;
         this.players.forEach(p => { p.word = this.puzzle.s; p.moves = 0; p.path = null; });
         this.path = [this.puzzle.s];
@@ -253,8 +295,10 @@ class Room {
       }
       case 'rematch': {
         if (this.gameState !== 'done') return;
-        if (!m.puzzle || typeof m.puzzle.s !== 'string' || typeof m.puzzle.e !== 'string') return;
-        this.puzzle = { s: m.puzzle.s.toLowerCase(), e: m.puzzle.e.toLowerCase(), o: m.puzzle.o | 0 };
+        const sp = pickPuzzle(this.settings, this.puzzle);
+        if (sp) this.puzzle = sp;
+        else if (m.puzzle && typeof m.puzzle.s === 'string' && typeof m.puzzle.e === 'string') this.puzzle = { s: m.puzzle.s.toLowerCase(), e: m.puzzle.e.toLowerCase(), o: m.puzzle.o | 0 };
+        else return;
         this.gameState = 'racing'; this.winner = null;
         this.players.forEach(p => { p.word = this.puzzle.s; p.moves = 0; p.path = null; });
         this.path = [this.puzzle.s];
@@ -338,11 +382,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/async/create' && req.method === 'POST') {
     const b = await readBody(req);
-    if (!b.puzzle || typeof b.puzzle.s !== 'string' || typeof b.puzzle.e !== 'string') return json(400, { error: 'bad puzzle' });
+    const stg = { len: (b.len | 0) || 4, diff: String(b.diff || 'easy'), lang: String(b.lang || 'en').slice(0, 4) };
+    let puzzle = pickPuzzle(stg, null);
+    if (!puzzle && b.puzzle && typeof b.puzzle.s === 'string' && typeof b.puzzle.e === 'string') puzzle = b.puzzle;
+    if (!puzzle) return json(400, { error: 'No puzzle available yet - try again in a moment.' });
     let code = makeCode(6);
     for (let tries = 0; tries < 8 && rooms.has(code) && !rooms.get(code).expired(); tries++) code = makeCode(6);
     const r = getRoom(code, true);
-    r.asyncInit(String(b.pid || '').slice(0, 40), String(b.name || 'Player').slice(0, 14), b.puzzle);
+    r.asyncInit(String(b.pid || '').slice(0, 40), String(b.name || 'Player').slice(0, 14), puzzle, stg);
     return json(200, { code });
   }
   if (url.pathname === '/api/async/join' && req.method === 'POST') {
@@ -353,6 +400,25 @@ const server = http.createServer(async (req, res) => {
     const out = r.asyncJoin(String(b.pid || '').slice(0, 40), String(b.name || 'Player').slice(0, 14) || 'Player');
     if (out.err) return json(out.err[0], out.err[1]);
     return json(200, out.state);
+  }
+  if (url.pathname === '/api/async/next' && req.method === 'POST') {
+    const code = (url.searchParams.get('room') || '').toUpperCase();
+    const r = getRoom(code, false);
+    if (!r || !r.initialized || r.mode !== 'async') return json(404, { error: 'Room not found or expired.' });
+    const b = await readBody(req);
+    const pid = String(b.pid || '').slice(0, 40);
+    if (!r.players.some(p => p.id === pid)) return json(403, { error: 'Only the two players can start the next game.' });
+    if (r.nextRoom && rooms.has(r.nextRoom)) return json(200, { code: r.nextRoom });
+    let puzzle = pickPuzzle(r.settings, r.puzzle);
+    if (!puzzle && b.puzzle && typeof b.puzzle.s === 'string' && typeof b.puzzle.e === 'string') puzzle = b.puzzle;
+    if (!puzzle) return json(400, { error: 'No puzzle available yet - try again in a moment.' });
+    let ncode = makeCode(6);
+    for (let tries = 0; tries < 8 && rooms.has(ncode) && !rooms.get(ncode).expired(); tries++) ncode = makeCode(6);
+    const nr = getRoom(ncode, true);
+    nr.asyncInitPair(r.players, puzzle, r.settings);
+    r.nextRoom = ncode;
+    r.touch();
+    return json(200, { code: ncode });
   }
   if (url.pathname === '/api/async/state' && req.method === 'GET') {
     const code = (url.searchParams.get('room') || '').toUpperCase();
