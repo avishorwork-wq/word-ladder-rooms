@@ -347,7 +347,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/async/join' && req.method === 'POST') {
     const code = (url.searchParams.get('room') || '').toUpperCase();
-    const r = getRoom(code, false);
+    const r = getRoom(code, false); if (r && r.mode !== 'async') return json(404, { error: 'Room not found or expired.' });
     if (!r || !r.initialized) return json(404, { error: 'Room not found or expired.' });
     const b = await readBody(req);
     const out = r.asyncJoin(String(b.pid || '').slice(0, 40), String(b.name || 'Player').slice(0, 14) || 'Player');
@@ -357,12 +357,12 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/async/state' && req.method === 'GET') {
     const code = (url.searchParams.get('room') || '').toUpperCase();
     const r = getRoom(code, false);
-    if (!r || !r.initialized) return json(404, { error: 'Room not found or expired.' });
+    if (!r || !r.initialized || r.mode !== 'async') return json(404, { error: 'Room not found or expired.' });
     return json(200, r.asyncState(url.searchParams.get('pid') || ''));
   }
   if (url.pathname === '/api/async/move' && req.method === 'POST') {
     const code = (url.searchParams.get('room') || '').toUpperCase();
-    const r = getRoom(code, false);
+    const r = getRoom(code, false); if (r && r.mode !== 'async') return json(404, { error: 'Room not found or expired.' });
     if (!r || !r.initialized) return json(404, { error: 'Room not found or expired.' });
     const b = await readBody(req);
     const out = r.asyncMove(String(b.pid || '').slice(0, 40), b.word);
