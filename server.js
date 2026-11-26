@@ -37,7 +37,14 @@ class Room {
     this.turnPid = null;
     this.nextSeq = 0;
     this.creatorPid = null;
+    this.settings = null; // {len,diff,lang} chosen by host
     this.lastActivity = Date.now();
+  }
+  randomTurn() {
+    const open = this.players.filter(p => p.ws);
+    const pool = open.length ? open : this.players;
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)].id;
   }
   touch() { this.lastActivity = Date.now(); }
   expired() { return Date.now() - this.lastActivity > (this.mode === 'async' ? ASYNC_TTL_MS : ROOM_TTL_MS); }
@@ -59,7 +66,10 @@ class Room {
       if (this.players.length >= 2) return { err: [403, { error: 'That game already has 2 players.' }] };
       player = { id: pid, name, seq: ++this.nextSeq, host: false, ws: null, word: '', moves: 0, path: null };
       this.players.push(player);
-      if (this.gameState === 'waiting') this.gameState = 'playing';
+      if (this.gameState === 'waiting' && this.players.length === 2) {
+        this.gameState = 'playing';
+        this.turnPid = Math.random() < 0.5 ? this.players[0].id : this.players[1].id;
+      }
     } else player.name = name;
     this.touch();
     return { state: this.asyncState(pid) };
@@ -106,6 +116,7 @@ class Room {
       t: 'room',
       players: this.players.filter(p => p.ws).map(p => ({ id: p.id, name: p.name, host: p.host })),
       state: this.gameState, mode: this.mode,
+      settings: this.settings,
       puzzle: this.gameState === 'racing' ? this.puzzle : null,
       path: this.mode === 'coop' && this.gameState === 'racing' ? this.path : null,
       turn: this.mode === 'coop' ? this.turnPid : null,
@@ -114,13 +125,17 @@ class Room {
   }
   joinWS(ws, pid, name) {
     const isOpen = p => p.ws && p.ws.readyState === 1;
+    if (this.mode === 'async') {
+      ws.send(JSON.stringify({ t: 'error', msg: 'That code is a Take Turns game - open it from the list on the home screen.', fatal: true }));
+      ws.close();
+      return;
+    }
     let player = this.players.find(p => p.id === pid);
     if (player) {
-      if (player.ws) { try { player.ws.close(); } catch (e) {} }
+      if (player.ws && player.ws !== ws) { try { player.ws.send(JSON.stringify({ t: 'replaced' })); } catch (e) {} try { player.ws.close(); } catch (e) {} }
       player.ws = ws; player.name = name;
     } else {
-      const deadIdx = this.players.findIndex(p => !isOpen(p));
-      if (deadIdx >= 0 && this.gameState !== 'racing') this.players.splice(deadIdx, 1);
+      if (this.gameState !== 'racing') this.players = this.players.filter(isOpen);
       if (this.players.filter(isOpen).length >= 2) {
         ws.send(JSON.stringify({ t: 'error', msg: 'That room is full (2 players).', fatal: true }));
         ws.close();
@@ -129,6 +144,7 @@ class Room {
       player = { id: pid, name, seq: ++this.nextSeq, host: false, ws, word: '', moves: 0, path: null };
       this.players.push(player);
     }
+    player.lastMsg = Date.now();
     const connected = this.players.filter(p => p.ws);
     const creator = connected.find(p => p.id === this.creatorPid);
     const hostP = creator || connected.slice().sort((a, b) => a.seq - b.seq)[0];
@@ -139,6 +155,7 @@ class Room {
   }
   wire(ws, player) {
     ws.on('message', data => {
+      player.lastMsg = Date.now();
       let m; try { m = JSON.parse(data); } catch (e) { return; }
       try { this.onMessage(player, m); } catch (e) { /* one bad message must never take the server down */ }
     });
@@ -153,6 +170,14 @@ class Room {
   onMessage(player, m) {
     switch (m.t) {
       case 'ping': this.sendTo(player, { t: 'pong', echo: m.ts }); return;
+      case 'settings': {
+        if (!player.host || this.gameState !== 'lobby') return;
+        const s = m.settings || {};
+        this.settings = { len: (s.len | 0) || 4, diff: String(s.diff || 'easy'), lang: String(s.lang || 'en').slice(0, 4) };
+        this.broadcast({ t: 'settings', settings: this.settings }, player.id);
+        this.touch();
+        return;
+      }
       case 'start': {
         if (!player.host || this.players.length < 2) return;
         if (!m.puzzle || typeof m.puzzle.s !== 'string' || typeof m.puzzle.e !== 'string') return;
@@ -160,7 +185,7 @@ class Room {
         this.gameState = 'racing'; this.winner = null;
         this.players.forEach(p => { p.word = this.puzzle.s; p.moves = 0; p.path = null; });
         this.path = [this.puzzle.s];
-        this.turnPid = player.id;
+        this.turnPid = this.mode === 'coop' ? this.randomTurn() : player.id;
         this.startedAt = Date.now();
         this.broadcast({ t: 'started', puzzle: this.puzzle, mode: this.mode, turn: this.turnPid, startAt: Date.now() + 3200 });
         this.touch();
@@ -233,7 +258,7 @@ class Room {
         this.gameState = 'racing'; this.winner = null;
         this.players.forEach(p => { p.word = this.puzzle.s; p.moves = 0; p.path = null; });
         this.path = [this.puzzle.s];
-        this.turnPid = player.id;
+        this.turnPid = this.mode === 'coop' ? this.randomTurn() : player.id;
         this.startedAt = Date.now();
         this.broadcast({ t: 'rematch', puzzle: this.puzzle, mode: this.mode, turn: this.turnPid, startAt: Date.now() + 3200 });
         this.touch();
@@ -251,6 +276,19 @@ function getRoom(code, create) {
   return r;
 }
 setInterval(() => { for (const [c, r] of rooms) if (r.expired()) rooms.delete(c); }, 10 * 60 * 1000).unref();
+// Drop zombie sockets: a backgrounded phone keeps TCP half-open and silently
+// misses room updates. Clients ping every 4s, so 25s of silence means dead.
+setInterval(() => {
+  const now = Date.now();
+  for (const [, r] of rooms) {
+    if (r.mode === 'async') continue;
+    for (const p of r.players) {
+      if (p.ws && p.ws.readyState === 1 && p.lastMsg && now - p.lastMsg > 25000) {
+        try { p.ws.close(); } catch (e) {}
+      }
+    }
+  }
+}, 10000).unref();
 
 // ---- HTTP ----
 function cors(req, res) {
@@ -287,8 +325,16 @@ const server = http.createServer(async (req, res) => {
     r.creatorPid = String(b.pid || '').slice(0, 40);
     const m = String(b.mode || 'race').toLowerCase();
     r.mode = m === 'coop' ? 'coop' : 'race';
+    const st = b.settings || {};
+    r.settings = { len: (st.len | 0) || 4, diff: String(st.diff || 'easy'), lang: String(st.lang || 'en').slice(0, 4) };
     r.touch();
     return json(200, { code });
+  }
+  if (url.pathname === '/api/room-info' && req.method === 'GET') {
+    const code = (url.searchParams.get('room') || '').toUpperCase();
+    const r = getRoom(code, false);
+    if (!r || !r.initialized) return json(404, { exists: false, error: 'Room not found or expired.' });
+    return json(200, { exists: true, mode: r.mode, state: r.gameState, players: r.players.filter(p => p.ws || r.mode === 'async').length, settings: r.settings });
   }
   if (url.pathname === '/api/async/create' && req.method === 'POST') {
     const b = await readBody(req);
