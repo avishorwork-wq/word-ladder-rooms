@@ -181,7 +181,7 @@ class Room {
         return;
       }
       if (ap.ws && ap.ws !== ws) { try { ap.ws.close(); } catch (e) {} }
-      ap.ws = ws; ap.name = name; ap.lastMsg = Date.now();
+      ap.ws = ws; ap.lastMsg = Date.now();
       ws.on('message', data => {
         ap.lastMsg = Date.now();
         let m; try { m = JSON.parse(data); } catch (e) { return; }
